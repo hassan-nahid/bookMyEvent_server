@@ -5,6 +5,8 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const port = process.env.PORT || 5000;
+const stripe = require('stripe')(process.env.STRIPE_SECRET);
+
 
 app.use(cors());
 app.use(express.json());
@@ -35,20 +37,7 @@ const verifyToken = (req, res, next) => {
   }
 };
 
-const verifyAdmin = async (req, res, next) => {
-  try {
-    const email = req.decoded.email;
-    const query = { email: email };
-    const user = await userCollection.findOne(query);
-    if (user?.role !== 'admin') {
-      return res.status(403).send({ error: true, message: 'Forbidden message' });
-    }
-    next();
-  } catch (error) {
-    console.error("Error verifying admin:", error);
-    return res.status(500).send("Internal Server Error");
-  }
-};
+
 
 const uri = process.env.MONGODB_URL;
 
@@ -66,10 +55,25 @@ async function run() {
   try {
     await client.connect();
     const database = client.db("bookMyEvent");
-    userCollection = database.collection("userCollection");
+    const userCollection = database.collection("userCollection");
     const eventCollection = database.collection("eventCollection");
     const bookingCollection = database.collection("bookingCollection");
     const paymentCollection = database.collection("paymentCollection");
+
+    const verifyAdmin = async (req, res, next) => {
+      try {
+        const email = req.decoded.email;
+        const query = { email: email };
+        const user = await userCollection.findOne(query);
+        if (user?.role !== 'admin') {
+          return res.status(403).send({ error: true, message: 'Forbidden message' });
+        }
+        next();
+      } catch (error) {
+        console.error("Error verifying admin:", error);
+        return res.status(500).send("Internal Server Error");
+      }
+    };
 
     app.post("/events", verifyToken, verifyAdmin, async (req, res) => {
       const event = req.body;
@@ -118,6 +122,8 @@ async function run() {
       res.send(result);
     });
 
+
+    // booking 
     app.post("/booking", verifyToken, async (req, res) => {
       const booking = req.body;
       const result = await bookingCollection.insertOne(booking);
@@ -128,12 +134,10 @@ async function run() {
       const email = req.params.email;
 
       try {
-        console.log(email);
 
         const query = { email: email };
         const bookings = await bookingCollection.find(query).toArray();
 
-        console.log(bookings);
 
         const eventIds = bookings.map(booking => new ObjectId(booking.eventId));
 
@@ -157,50 +161,112 @@ async function run() {
         res.status(500).json({ error: "Internal server error" });
       }
     });
+    app.delete("/booking_tickets/:id", verifyToken, async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+      const result = await bookingCollection.deleteOne(query);
+      res.send(result);
+    });
 
- 
+
+    // payment
     app.post("/process_payment", verifyToken, async (req, res) => {
       const { ticketId, paymentDetails } = req.body;
-    
+
       try {
         const booking = await bookingCollection.findOne({ _id: new ObjectId(ticketId) });
-    
+
         if (!booking) {
           return res.status(404).json({ error: "Ticket not found" });
         }
-    
+
         const eventUpdateResult = await eventCollection.updateOne(
           { _id: new ObjectId(booking.eventId) },
           { $inc: { "tickets.available": -parseInt(booking.tickets) } }
         );
-    
+
         if (eventUpdateResult.modifiedCount === 0) {
           return res.status(500).json({ error: "Failed to update event tickets" });
         }
-    
+
         const paymentData = {
           ...paymentDetails,
-          email: booking.email,
-          eventId: booking.eventId,
-          tickets: booking.tickets,
-          totalPrice: booking.totalPrice,
           paymentDate: new Date(),
         };
-    
+
         const paymentResult = await paymentCollection.insertOne(paymentData);
-    
+
         const deleteResult = await bookingCollection.deleteOne({ _id: new ObjectId(ticketId) });
-    
+
         if (deleteResult.deletedCount === 0) {
           return res.status(500).json({ error: "Failed to delete the ticket" });
         }
-    
+
         res.json({ message: "Payment processed and ticket deleted successfully", paymentId: paymentResult.insertedId });
       } catch (error) {
         console.error("Error processing payment:", error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
+
+    app.post("/checkout_session", verifyToken, async (req, res) => {
+      const { ticketId, paymentDetails } = req.body;
+    
+      try {
+        // Create a Stripe Checkout session
+        const lineItems = [
+          {
+            price_data: {
+              currency: "usd",
+              product_data: {
+                name: paymentDetails?.eventName || "Event Ticket",
+              },
+              unit_amount: Math.round(paymentDetails?.price * 100),
+            },
+            quantity: 1,
+          }
+        ];
+    
+        const session = await stripe.checkout.sessions.create({
+          payment_method_types: ["card"],
+          line_items: lineItems,
+          mode: "payment",
+          success_url: "http://localhost:5173/success",
+          cancel_url: "http://localhost:5173/cancel",
+        });
+    
+        if (!session) {
+          return res.status(500).json({ error: "Failed to create checkout session" });
+        }
+
+        // Respond with session ID and additional information
+        res.json({
+          sessionId: session.id,
+          message: "Payment processed and ticket deleted successfully",
+          // paymentId: paymentResult.insertedId
+        });
+      } catch (error) {
+        console.error("Error creating checkout session:", error);
+        res.status(500).json({ error: "Internal server error" });
+      }
+    });
+    
+    
+    
+
+
+    app.get("/my_tickets/:email", verifyToken, async (req, res) => {
+
+      const email = req.params.email;
+      const query = { email: email };
+      const bookings = await paymentCollection.find(query).toArray();
+
+      res.send(bookings)
+
+
+    })
+
+
 
 
     // User api
@@ -281,6 +347,13 @@ async function run() {
         res.status(500).send("Error deleting user");
       }
     });
+
+
+
+
+
+
+
 
     await client.db("admin").command({ ping: 1 });
     console.log("Successfully connected to MongoDB!");
